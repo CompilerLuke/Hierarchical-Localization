@@ -2,6 +2,7 @@ import argparse
 import collections.abc as collections
 from pathlib import Path
 from typing import Optional
+import itertools
 
 import h5py
 import numpy as np
@@ -41,9 +42,13 @@ def get_descriptors(names, path, name2idx=None, key="global_descriptor"):
             desc = [fd[n][key].__array__() for n in names]
     else:
         desc = []
-        for n in names:
-            with h5py.File(str(path[name2idx[n]]), "r", libver="latest") as fd:
-                desc.append(fd[n][key].__array__())
+
+        names_by_db = itertools.groupby(names, key=lambda name: name2idx[name])
+        for idx, group in names_by_db:
+            with h5py.File(str(path[idx]), "r", libver="latest") as fd:
+                for name in group:
+                    desc.append(fd[name][key].__array__())
+
     return torch.from_numpy(np.stack(desc, 0)).float()
 
 
@@ -120,7 +125,7 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--descriptors", type=Path, required=True)
+    parser.add_argument("--retrieval", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--num_matched", type=int, required=True)
     parser.add_argument("--query_prefix", type=str, nargs="+")

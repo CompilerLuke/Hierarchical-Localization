@@ -14,7 +14,7 @@ import torch
 from tqdm import tqdm
 
 from . import extractors, logger
-from .utils.base_model import dynamic_load
+from .utils.base_model import dynamic_load, select_device
 from .utils.io import list_h5_names, read_image
 from .utils.parsers import parse_image_lists
 
@@ -114,7 +114,7 @@ confs = {
             "resize_max": 1600,
         },
     },
-    # Global descriptors
+    # Global retrieval
     "dir": {
         "output": "global-feats-dir",
         "model": {"name": "dir"},
@@ -154,6 +154,47 @@ def resize_image(image, size, interp):
         raise ValueError(f"Unknown interpolation {interp}.")
     return resized
 
+def normalize_image(conf, image: Union[np.array, torch.tensor]):
+    if type(conf) is dict:
+        conf = SimpleNamespace(**{**ImageDataset.default_conf, **conf})
+
+    image = image.astype(np.float32)
+    size = image.shape[:2][::-1]
+
+    if conf.resize_max and (conf.resize_force or max(size) > conf.resize_max):
+        scale = conf.resize_max / max(size)
+        size_new = tuple(int(round(x * scale)) for x in size)
+        image = resize_image(image, size_new, conf.interpolation)
+
+    if conf.grayscale:
+        image = image[None] if len(image.shape)==2 else image[:,:,0][None]
+    else:
+        image = image.transpose((2, 0, 1))  # HxWxC to CxHxW
+    image = image / 255.0
+
+    data = {
+        "image": image,
+        "original_size": np.array(size),
+    }
+    return data
+
+def calculate_uncertainity(model, data, pred):
+    if not "keypoints" in pred:
+        return None
+    original_size = data["original_size"]
+    size = np.array(data["image"].shape[-2:][::-1])
+    scales = (original_size / size).astype(np.float32)
+
+    keypoints = pred["keypoints"]
+    if isinstance(keypoints, torch.Tensor):
+        scales = torch.tensor(scales, device=keypoints.device)
+
+    pred["keypoints"] = (pred["keypoints"] + 0.5) * scales[None] - 0.5
+    if "scales" in pred:
+        pred["scales"] *= scales.mean()
+    # add keypoint uncertainties scaled to the original resolution
+    uncertainty = getattr(model, "detection_noise", 1) * scales.mean()
+    return uncertainty
 
 class ImageDataset(torch.utils.data.Dataset):
     default_conf = {
@@ -192,27 +233,7 @@ class ImageDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         name = self.names[idx]
         image = read_image(self.root / name, self.conf.grayscale)
-        image = image.astype(np.float32)
-        size = image.shape[:2][::-1]
-
-        if self.conf.resize_max and (
-            self.conf.resize_force or max(size) > self.conf.resize_max
-        ):
-            scale = self.conf.resize_max / max(size)
-            size_new = tuple(int(round(x * scale)) for x in size)
-            image = resize_image(image, size_new, self.conf.interpolation)
-
-        if self.conf.grayscale:
-            image = image[None]
-        else:
-            image = image.transpose((2, 0, 1))  # HxWxC to CxHxW
-        image = image / 255.0
-
-        data = {
-            "image": image,
-            "original_size": np.array(size),
-        }
-        return data
+        return normalize_image(self.conf)
 
     def __len__(self):
         return len(self.names)
@@ -244,7 +265,7 @@ def main(
         logger.info("Skipping the extraction.")
         return feature_path
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = select_device()
     Model = dynamic_load(extractors, conf["model"]["name"])
     model = Model(conf["model"]).eval().to(device)
 
@@ -257,20 +278,10 @@ def main(
         pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
 
         pred["image_size"] = original_size = data["original_size"][0].numpy()
-        if "keypoints" in pred:
-            size = np.array(data["image"].shape[-2:][::-1])
-            scales = (original_size / size).astype(np.float32)
-            pred["keypoints"] = (pred["keypoints"] + 0.5) * scales[None] - 0.5
-            if "scales" in pred:
-                pred["scales"] *= scales.mean()
-            # add keypoint uncertainties scaled to the original resolution
-            uncertainty = getattr(model, "detection_noise", 1) * scales.mean()
+        uncertainty = calculate_uncertainity(data, pred)
 
         if as_half:
-            for k in pred:
-                dt = pred[k].dtype
-                if (dt == np.float32) and (dt != np.float16):
-                    pred[k] = pred[k].astype(np.float16)
+            pred = {k: pred[k].astype(np.float16) for k in pred if pred[k].ktype!=np.float16}
 
         with h5py.File(str(feature_path), "a", libver="latest") as fd:
             try:
